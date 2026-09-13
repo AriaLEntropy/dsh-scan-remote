@@ -10,6 +10,8 @@ import {
   SealedPayload,
   SecureCipher,
 } from "./e2ee.js";
+import { logDebug, logError, logInfo, logWarn } from "./log-buffer.js";
+import { appLogs } from "./app-log-buffer.js";
 
 export type Envelope = {
   v: 1;
@@ -101,6 +103,13 @@ function closeSocket(socket: WebSocket, code: unknown, reason: unknown) {
 
 const liveClients = new Map<string, RelayClient>();
 
+/**
+ * Resolve the Host browser-auth Cookie header for the current DSH generation.
+ * New-generation Hosts (Gateway/Typert) reject Bearer and require the signed
+ * browser cookie; this returns it (or null on the legacy generation).
+ */
+export type HostAuthProvider = () => Promise<string | null>;
+
 export class RelayClient {
   private ws?: WebSocket;
   private stopped = false;
@@ -117,7 +126,10 @@ export class RelayClient {
   private localSockets = new Map<string, LocalSocket>();
   private localRequests = new Map<string, LocalRequest>();
 
-  constructor(private config: Config) {}
+  constructor(
+    private config: Config,
+    private readonly hostAuth: HostAuthProvider = async () => null,
+  ) {}
 
   status() {
     return { connected: this.authenticated, dsh: this.health };
@@ -126,6 +138,7 @@ export class RelayClient {
   async start() {
     this.stopped = false;
     this.occupySlot();
+    logInfo("relay", "Starting Relay client", this.relayWsUrl());
     await this.checkHealth();
     if (this.stopped) return;
     clearInterval(this.healthTimer);
@@ -136,6 +149,7 @@ export class RelayClient {
   stop() {
     this.stopped = true;
     this.authenticated = false;
+    logInfo("relay", "Relay client stopped");
     this.connectGeneration += 1;
     this.releaseSlot();
     clearTimeout(this.reconnectTimer);
@@ -149,7 +163,10 @@ export class RelayClient {
     const hostId = this.config.hostId;
     if (!hostId) return;
     const existing = liveClients.get(hostId);
-    if (existing && existing !== this) existing.stop();
+    if (existing && existing !== this) {
+      logWarn("relay", "Replacing an existing Relay client for the same host");
+      existing.stop();
+    }
     liveClients.set(hostId, this);
   }
 
@@ -183,6 +200,7 @@ export class RelayClient {
     const generation = ++this.connectGeneration;
     clearTimeout(this.reconnectTimer);
     this.dropSocket();
+    logDebug("relay", "Opening Relay WebSocket", this.relayWsUrl());
     const ws = new WebSocket(this.relayWsUrl());
     this.ws = ws;
     ws.on("open", () => {
@@ -222,7 +240,8 @@ export class RelayClient {
       const schedule = [1000, 2000, 5000, 10000, 30000];
       const delay = schedule[Math.min(this.retry++, schedule.length - 1)];
       const detail = String(reason ?? "").trim();
-      console.log(
+      logWarn(
+        "relay",
         `Relay disconnected (${code}${detail ? ` ${detail}` : ""}); retrying in ${delay / 1000}s`,
       );
       this.reconnectTimer = setTimeout(() => {
@@ -230,7 +249,9 @@ export class RelayClient {
         this.connect();
       }, delay);
     });
-    ws.on("error", () => undefined);
+    ws.on("error", (error) => {
+      logError("relay", "Relay WebSocket error", String(error));
+    });
   }
 
   private sendOuter(type: string, payload: any) {
@@ -251,11 +272,17 @@ export class RelayClient {
     return this.sendOuter("sealed", { accessSessionId, ...sealed });
   }
 
-  private upstreamHeaders(input: Record<string, unknown>) {
+  private upstreamHeaders(
+    input: Record<string, unknown>,
+    hostCookie: string | null = null,
+  ) {
     const authority = `127.0.0.1:${this.config.dshPort}`;
     const headers: Record<string, any> = { ...input, host: authority };
     if (headers.origin) headers.origin = `http://${authority}`;
     if (headers.referer) headers.referer = `http://${authority}/`;
+    // New-generation Host auth: the tunnel authenticates on the app's behalf.
+    // An app-supplied cookie wins so a caller could still override it.
+    if (hostCookie && !headers.cookie) headers.cookie = hostCookie;
     delete headers.forwarded;
     delete headers["x-forwarded-for"];
     delete headers["x-forwarded-host"];
@@ -282,6 +309,13 @@ export class RelayClient {
       this.healthCheckInFlight = false;
     }
     this.health = this.healthTracker.update(reachable);
+    if (before !== this.health) {
+      logInfo(
+        "health",
+        `DSH is ${this.health ? "online" : "offline"}`,
+        `http://127.0.0.1:${this.config.dshPort}/`,
+      );
+    }
     if (before !== this.health || this.authenticated)
       this.sendOuter("status", { dsh: this.health ? "online" : "offline" });
   }
@@ -290,7 +324,8 @@ export class RelayClient {
     if (msg.type === "auth_ok") {
       this.authenticated = true;
       this.retry = 0;
-      console.log(
+      logInfo(
+        "relay",
         `Connected to Relay; DSH is ${this.health ? "online" : "offline"}`,
       );
       this.sendOuter("status", { dsh: this.health ? "online" : "offline" });
@@ -322,7 +357,9 @@ export class RelayClient {
       const accepted = acceptClientHello(this.config.e2eeMasterKey, hello);
       this.secureSessions.set(sessionId, accepted.cipher);
       this.sendOuter("server_hello", accepted.hello);
+      logInfo("tunnel", "Secure tunnel established", sessionId);
     } catch {
+      logWarn("tunnel", "E2EE handshake failed", sessionId);
       this.sendOuter("device_close", {
         accessSessionId: sessionId,
         reason: "e2ee_handshake_failed",
@@ -353,20 +390,32 @@ export class RelayClient {
       });
       if (!isEnvelope(inner)) throw new E2eeError("invalid inner envelope");
       this.handleInner(sessionId, inner);
-    } catch {
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      logWarn("tunnel", `Secure frame rejected; closing tunnel (${reason})`, sessionId);
       this.closeSession(sessionId, true);
     }
   }
 
   private handleInner(sessionId: string, msg: Envelope) {
-    if (msg.type === "http_req") return this.http(sessionId, msg);
+    if (msg.type === "app_log_batch") {
+      appLogs.ingest(msg.payload?.entries);
+      return;
+    }
+    if (msg.type === "http_req") {
+      void this.http(sessionId, msg);
+      return;
+    }
     if (msg.type === "http_close") {
       const entry = this.localRequests.get(this.channelKey(sessionId, msg.channel));
       entry?.request.destroy();
       this.localRequests.delete(this.channelKey(sessionId, msg.channel));
       return;
     }
-    if (msg.type === "ws_open") return this.openWs(sessionId, msg);
+    if (msg.type === "ws_open") {
+      void this.openWs(sessionId, msg);
+      return;
+    }
     if (msg.type === "ws_frame") {
       const entry = this.localSockets.get(this.channelKey(sessionId, msg.channel));
       if (entry?.socket.readyState === WebSocket.OPEN)
@@ -382,7 +431,7 @@ export class RelayClient {
       this.localSockets.delete(key);
       return;
     }
-    throw new E2eeError("unsupported inner type");
+    logWarn("tunnel", `Ignoring unsupported inner type: ${msg.type}`, sessionId);
   }
 
   private channelKey(sessionId: string, channel: unknown) {
@@ -404,7 +453,7 @@ export class RelayClient {
     return count;
   }
 
-  private http(sessionId: string, msg: Envelope) {
+  private async http(sessionId: string, msg: Envelope) {
     const channel = msg.channel ?? "";
     const key = this.channelKey(sessionId, channel);
     if (this.sessionRequestCount(sessionId) >= MAX_HTTP_CHANNELS) {
@@ -428,7 +477,8 @@ export class RelayClient {
     const body = Buffer.from(msg.payload.bodyB64 ?? "", "base64");
     if (body.length > MAX_HTTP_REQUEST_BYTES)
       throw new E2eeError("request too large");
-    const headers = this.upstreamHeaders(msg.payload.headers ?? {});
+    const hostCookie = await this.hostAuth().catch(() => null);
+    const headers = this.upstreamHeaders(msg.payload.headers ?? {}, hostCookie);
     delete headers["content-length"];
     const req = http.request(
       {
@@ -523,7 +573,7 @@ export class RelayClient {
     req.end();
   }
 
-  private openWs(sessionId: string, msg: Envelope) {
+  private async openWs(sessionId: string, msg: Envelope) {
     const channel = msg.channel ?? "";
     if (this.sessionSocketCount(sessionId) >= MAX_WS_CHANNELS) {
       this.sendInner(
@@ -537,7 +587,8 @@ export class RelayClient {
     const key = this.channelKey(sessionId, channel);
     const path = localPath(msg.payload.path);
     const url = `ws://127.0.0.1:${this.config.dshPort}${path}`;
-    const headers = this.upstreamHeaders(msg.payload.headers ?? {});
+    const hostCookie = await this.hostAuth().catch(() => null);
+    const headers = this.upstreamHeaders(msg.payload.headers ?? {}, hostCookie);
     const socket = new WebSocket(url, { headers });
     this.localSockets.set(key, { sessionId, socket });
     socket.on("open", () => this.sendInner(sessionId, "ws_open_ok", {}, channel));
@@ -565,7 +616,9 @@ export class RelayClient {
   }
 
   private closeSession(sessionId: string, notify: boolean) {
-    this.secureSessions.delete(sessionId);
+    if (this.secureSessions.delete(sessionId)) {
+      logInfo("tunnel", "Secure tunnel closed", sessionId);
+    }
     for (const [key, entry] of this.localRequests) {
       if (entry.sessionId !== sessionId) continue;
       entry.request.destroy();

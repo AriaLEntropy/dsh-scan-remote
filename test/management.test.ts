@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { createManagementHandler } from "../src/management.js";
+import { scanRemoteLogs } from "../src/log-buffer.js";
 import { RemoteAccessManager } from "../src/remote-access.js";
 
 test("management mutations are local-only while state remains readable", async () => {
@@ -74,6 +75,106 @@ test("local management can remove an active pairing", async () => {
     assert.equal(revokedToken, "token_private");
     assert.equal(savedToken, undefined);
   } finally {
+    manager.dispose();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("logs page and API expose buffered events", async () => {
+  scanRemoteLogs.clear();
+  scanRemoteLogs.append("info", "relay", "connected");
+  const manager = new RemoteAccessManager({
+    hostName: "Test Mac",
+    relay: "https://relay.test",
+    dshPort: 3080,
+  }, { probeDsh: async () => true });
+  const server = createServer(createManagementHandler(manager));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const page = await fetch(`${base}/dsh-scan-remote/logs`);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /dsh-scan-remote 日志/);
+
+    const logs = await fetch(`${base}/dsh-scan-remote/api/logs?level=info`);
+    assert.equal(logs.status, 200);
+    const body = await logs.json();
+    assert.equal(body.entries.length, 1);
+    assert.equal(body.entries[0].message, "connected");
+
+    const cleared = await fetch(`${base}/dsh-scan-remote/api/logs`, { method: "DELETE" });
+    assert.equal(cleared.status, 200);
+    const afterClear = await (await fetch(`${base}/dsh-scan-remote/api/logs`)).json();
+    assert.equal(afterClear.entries.length, 0);
+  } finally {
+    scanRemoteLogs.clear();
+    manager.dispose();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("remote clients can read logs but not clear them", async () => {
+  scanRemoteLogs.clear();
+  scanRemoteLogs.append("warn", "relay", "retrying");
+  const manager = new RemoteAccessManager({
+    hostName: "Test Mac",
+    relay: "https://relay.test",
+    dshPort: 3080,
+  }, { probeDsh: async () => true });
+  const server = createServer(createManagementHandler(manager));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const logs = await fetch(`${base}/dsh-scan-remote/api/logs`, {
+      headers: { "x-dsh-scan-remote": "1" },
+    });
+    assert.equal(logs.status, 200);
+    assert.equal((await logs.json()).entries[0].message, "retrying");
+
+    const cleared = await fetch(`${base}/dsh-scan-remote/api/logs`, {
+      method: "DELETE",
+      headers: { "x-dsh-scan-remote": "1" },
+    });
+    assert.equal(cleared.status, 403);
+  } finally {
+    scanRemoteLogs.clear();
+    manager.dispose();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("app logs page and API accept forwarded phone events", async () => {
+  const { appLogs } = await import("../src/app-log-buffer.js");
+  appLogs.clear();
+  appLogs.ingest([{ id: "a1", ts: Date.now(), level: "info", tag: "DshRelay", message: "ready" }]);
+  const manager = new RemoteAccessManager({
+    hostName: "Test Mac",
+    relay: "https://relay.test",
+    dshPort: 3080,
+  }, { probeDsh: async () => true });
+  const server = createServer(createManagementHandler(manager));
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const page = await fetch(`${base}/dsh-scan-remote/app-logs`);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /DSH App 日志/);
+    const logs = await fetch(`${base}/dsh-scan-remote/api/app-logs`);
+    assert.equal((await logs.json()).entries[0].message, "ready");
+  } finally {
+    appLogs.clear();
     manager.dispose();
     server.close();
     await once(server, "close");

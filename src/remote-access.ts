@@ -1,9 +1,10 @@
 import { Config, saveConfig } from "./config.js";
 import { qrSvg } from "./qr.js";
 import { pairingLink, publicRelayOrigin } from "./pair-link.js";
-import { RelayClient } from "./relay-client.js";
+import { RelayClient, type HostAuthProvider } from "./relay-client.js";
 import { deriveClaimToken, generateMasterKey, hashClaimToken } from "./e2ee.js";
 import { dshCompatibility } from "./dsh-compat.js";
+import { formatError, logInfo, logWarn } from "./log-buffer.js";
 
 type PairSession = {
   pairId: string;
@@ -51,7 +52,9 @@ type RelayConnection = {
 type Dependencies = {
   request: (url: string, data: unknown) => Promise<{ status: number; data: any }>;
   save: typeof saveConfig;
-  createClient: (config: Config) => RelayConnection;
+  createClient: (config: Config, hostAuth: HostAuthProvider) => RelayConnection;
+  /** Host browser-auth cookie provider for the current DSH generation. */
+  hostAuth: HostAuthProvider;
   probeDsh: (port: number) => Promise<boolean>;
   pollIntervalMs: number;
   requestAccessSessions: (config: Config) => Promise<AccessSession[]>;
@@ -109,7 +112,8 @@ async function requestUnbind(config: Config) {
 const defaults: Dependencies = {
   request: post,
   save: saveConfig,
-  createClient: (config) => new RelayClient(config),
+  createClient: (config, hostAuth) => new RelayClient(config, hostAuth),
+  hostAuth: async () => null,
   probeDsh,
   pollIntervalMs: 2000,
   requestAccessSessions,
@@ -180,6 +184,7 @@ export class RemoteAccessManager {
         expiresAt: created.data.expiresAt,
         masterKey,
       };
+      logInfo("pairing", "Pairing QR created", created.data.pairId);
       this.schedulePoll(this.deps.pollIntervalMs);
     }
     return this.state();
@@ -199,6 +204,7 @@ export class RemoteAccessManager {
   async removePairing(): Promise<RemoteAccessState> {
     if (this.pairing) {
       this.cancelPairing();
+      logInfo("pairing", "Pairing cancelled");
       return this.state();
     }
     if (!this.config.hostId || !this.config.hostToken) return this.state();
@@ -215,6 +221,7 @@ export class RemoteAccessManager {
       dshPort: this.config.dshPort,
     };
     await this.deps.save(this.config);
+    logInfo("pairing", "Pairing removed");
     return this.state();
   }
 
@@ -245,6 +252,7 @@ export class RemoteAccessManager {
     if (!session || this.disposed) return;
     if (Date.now() >= session.expiresAt) {
       this.cancelPairing();
+      logWarn("pairing", "Pairing QR expired", session.pairId);
       return;
     }
     try {
@@ -270,14 +278,17 @@ export class RemoteAccessManager {
           await this.deps.requestUnbind(previous).catch(() => undefined);
         }
         await this.deps.save(this.config);
+        logInfo("pairing", "Pairing confirmed", confirmed.data.hostId);
         await this.connect();
         return;
       }
       if (confirmed.status !== 202) {
         this.cancelPairing();
+        logWarn("pairing", `Pairing failed (${confirmed.status})`, session.pairId);
         return;
       }
-    } catch {
+    } catch (error) {
+      logWarn("pairing", "Pairing poll failed", formatError(error));
       // Transient Relay failures must not drop a still-valid QR.
     }
     if (this.pairing === session) this.schedulePoll(this.deps.pollIntervalMs);
@@ -286,7 +297,8 @@ export class RemoteAccessManager {
   private async connect() {
     if (this.disposed) return;
     this.client?.stop();
-    this.client = this.deps.createClient(this.config);
+    this.client = this.deps.createClient(this.config, this.deps.hostAuth);
+    logInfo("manager", "Connecting Relay client");
     if (this.disposed) {
       this.client.stop();
       this.client = undefined;

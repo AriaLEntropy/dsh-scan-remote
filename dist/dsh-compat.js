@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { EXPECTED_DSH_VERSION } from "./version.js";
+import { EXPECTED_DSH_VERSION, compareVersions } from "./version.js";
 export function detectDshVersion(cwd = process.cwd()) {
     const candidates = [
         join(cwd, "node_modules/@deepseek-ai/dsh/package.json"),
@@ -30,13 +30,17 @@ export function detectDshVersion(cwd = process.cwd()) {
 }
 export function dshCompatibility(cwd = process.cwd()) {
     const detectedVersion = detectDshVersion(cwd);
-    const compatible = detectedVersion === EXPECTED_DSH_VERSION;
+    // Newer generations are allowed: the plugin authenticates to the Host on the
+    // app's behalf, so a newer Host is fine. Only an older-than-expected version
+    // is blocked (the downgrade guard).
+    const compatible = detectedVersion == null ||
+        compareVersions(detectedVersion, EXPECTED_DSH_VERSION) >= 0;
     return {
         expectedVersion: EXPECTED_DSH_VERSION,
         detectedVersion,
-        compatible: detectedVersion == null ? true : compatible,
+        compatible,
         message: detectedVersion && !compatible
-            ? `This plugin is tested against DSH ${EXPECTED_DSH_VERSION}. Detected ${detectedVersion}. Upgrade DSH or this plugin before pairing.`
+            ? `This plugin is tested against DSH >= ${EXPECTED_DSH_VERSION}. Detected ${detectedVersion}. Upgrade DSH or this plugin before pairing.`
             : null,
     };
 }

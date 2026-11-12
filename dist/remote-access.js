@@ -5,11 +5,14 @@ import { RelayClient } from "./relay-client.js";
 import { deriveClaimToken, generateMasterKey, hashClaimToken } from "./e2ee.js";
 import { dshCompatibility } from "./dsh-compat.js";
 import { formatError, logInfo, logWarn } from "./log-buffer.js";
-async function post(url, data) {
+const waitTimeoutMs = 25_000;
+const retryDelayMs = 3000;
+async function post(url, data, signal) {
     const response = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(data),
+        signal,
     });
     return { status: response.status, data: (await response.json()) };
 }
@@ -185,6 +188,36 @@ export class RemoteAccessManager {
             return;
         }
         try {
+            if (!session.waitUnsupported) {
+                const waited = await this.deps.request(`${this.config.relay}/pair/wait`, {
+                    pairId: session.pairId,
+                    confirmSecret: session.confirmSecret,
+                    timeoutMs: waitTimeoutMs,
+                }, AbortSignal.timeout(waitTimeoutMs + 5000));
+                if (this.pairing !== session || this.disposed)
+                    return;
+                if (waited.status === 404) {
+                    session.waitUnsupported = true;
+                    this.schedulePoll(0);
+                    return;
+                }
+                if (waited.status === 410) {
+                    this.cancelPairing();
+                    return;
+                }
+                if (waited.status === 429) {
+                    this.schedulePoll(retryDelayMs);
+                    return;
+                }
+                if (waited.status !== 200) {
+                    this.cancelPairing();
+                    return;
+                }
+                if (waited.data?.status !== "claimed") {
+                    this.schedulePoll(0);
+                    return;
+                }
+            }
             const confirmed = await this.deps.request(`${this.config.relay}/pair/confirm`, {
                 pairId: session.pairId,
                 confirmSecret: session.confirmSecret,
@@ -210,6 +243,10 @@ export class RemoteAccessManager {
                 await this.connect();
                 return;
             }
+            if (confirmed.status === 429) {
+                this.schedulePoll(retryDelayMs);
+                return;
+            }
             if (confirmed.status !== 202) {
                 this.cancelPairing();
                 logWarn("pairing", `Pairing failed (${confirmed.status})`, session.pairId);
@@ -219,9 +256,12 @@ export class RemoteAccessManager {
         catch (error) {
             logWarn("pairing", "Pairing poll failed", formatError(error));
             // Transient Relay failures must not drop a still-valid QR.
+            if (this.pairing === session)
+                this.schedulePoll(this.deps.pollIntervalMs);
+            return;
         }
         if (this.pairing === session)
-            this.schedulePoll(this.deps.pollIntervalMs);
+            this.schedulePoll(session.waitUnsupported ? this.deps.pollIntervalMs : 0);
     }
     async connect() {
         if (this.disposed)
